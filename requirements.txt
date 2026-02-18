@@ -1,0 +1,8 @@
+streamlit
+pandas
+httpx
+certifi
+requests
+urllib3
+python-dotenv
+streamlit-javascript
