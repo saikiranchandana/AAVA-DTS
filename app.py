@@ -108,7 +108,7 @@ def create_session_p1():
     })
     return client
 
-def execute_workflow_async(pipeline_id, user_inputs_dict, user_email="samuvel.isaac@ascendion.com"):
+def execute_workflow_async(pipeline_id, user_inputs_dict, user_email="saikiran.chandana@ascendion.com"):
     submit_url = API_URL_P1
     headers = {
         "Authorization": f"Bearer {API_KEY_P1}",
@@ -117,36 +117,83 @@ def execute_workflow_async(pipeline_id, user_inputs_dict, user_email="samuvel.is
     }
     
     # Send as multipart/form-data using the 'files' format for fields
+    # Ordered to match required structure: pipelineId, user, userInputs, priority, files
     files = {
         "pipelineId": (None, str(pipeline_id)),
-        "pipeLineId": (None, str(pipeline_id)),
-        "userInputs": (None, json.dumps(user_inputs_dict)),
         "user": (None, user_email),
+        "userInputs": (None, json.dumps(user_inputs_dict)),
         "priority": (None, "1")
     }
+
+
     
     start_time = time.time()
-    # 1) Submit
-    r = requests.post(submit_url, headers=headers, files=files, verify=False, timeout=30)
+    # 1) Submit - Increased timeout for initial submission
+    r = requests.post(submit_url, headers=headers, files=files, verify=False, timeout=60)
     if r.status_code != 200:
-        raise Exception(f"Submit failed ({r.status_code}): {r.text}")
+        try:
+            err_msg = r.json().get("message", r.text)
+        except:
+            err_msg = r.text
+        raise Exception(f"Submit failed ({r.status_code}): {err_msg}")
     
     execution_id = r.json().get("data", {}).get("workflowExecutionId")
     if not execution_id:
         raise Exception(f"Submit failed: No executionId in response {r.text}")
         
-    # 2) Poll
+    # 2) Poll - Increased iterations to 100 (500s total)
     status_url = f"{submit_url}?execution-id={execution_id}"
-    for _ in range(50):
-        rs = requests.get(status_url, headers=headers, verify=False, timeout=20)
-        s_data = rs.json()
-        exec_list = s_data.get("data", {}).get("workflowExecutionResponseList", [])
-        status = exec_list[0].get("status") if exec_list else None
-        if status == "SUCCESS": break
-        if status == "FAILED": raise Exception(f"Workflow failed: {s_data}")
-        time.sleep(5)
+    last_status_data = {}
+    for _ in range(100):
+        try:
+            rs = requests.get(status_url, headers=headers, verify=False, timeout=30)
+            rs.raise_for_status()
+            s_data = rs.json()
+            last_status_data = s_data
+            exec_list = s_data.get("data", {}).get("workflowExecutionResponseList", [])
+            
+            if not exec_list:
+                time.sleep(5)
+                continue
+                
+            status = exec_list[0].get("status")
+            if status == "SUCCESS": 
+                break
+            if status == "FAILED":
+                # Try to extract more detailed error info
+                error_detail = exec_list[0].get("error") or exec_list[0].get("message")
+                
+                # Try to fetch result even on failure - some systems put errors in the result
+                try:
+                    res_url = f"{submit_url}/{execution_id}/result"
+                    rr = requests.get(res_url, headers=headers, verify=False, timeout=10)
+                    if rr.status_code == 200:
+                        res_data = rr.json()
+                        result_error = res_data.get("data", {}).get("result", {}).get("response", {}).get("error")
+                        if result_error:
+                            error_detail = f"{error_detail} | Result Error: {result_error}" if error_detail else result_error
+                except:
+                    pass
+
+                if not error_detail:
+                    error_detail = "No specific error field found in response"
+                
+                workflow_name = exec_list[0].get("workflowName", "unknown")
+                exec_id = exec_list[0].get("executionId", execution_id)
+                error_msg = f"Workflow '{workflow_name}' (ID: {exec_id}) failed.\n\nReason: {error_detail}\n\nFull Diagnostic Info: {json.dumps(s_data, indent=2)}"
+                raise Exception(error_msg)
+
+
+            
+            # If status is still PENDING or IN_PROGRESS, wait
+            time.sleep(5)
+        except requests.exceptions.RequestException as e:
+            # Persistent network issues during polling
+            # st.warning(f"Polling interrupted: {e}. Retrying...")
+            time.sleep(5)
     else:
-        raise Exception("Workflow timed out waiting for SUCCESS")
+        raise Exception(f"Workflow timed out waiting for SUCCESS. Last data: {json.dumps(last_status_data)}")
+
         
     # 3) Result
     res_url = f"{submit_url}/{execution_id}/result"
@@ -780,8 +827,13 @@ def tab1_determine_lineage():
                     res = process_agent(content)
     
                 if not res.get("success"):
-                    st.error("❌ Processing failed.")
-                    st.json(res.get("error", {}))
+                    st.error("❌ **Lineage Generation Failed**")
+                    err_val = res.get("error", {}).get("error", "Unknown error")
+                    st.markdown(f"> {str(err_val)}")
+                    
+                    with st.expander("📋 Technical Error Details"):
+                        st.json(res.get("error", {}))
+
                 else:
                     file_name_value = os.path.splitext(uploaded_file.name)[0] if uploaded_file else github_res[0]
                     last_dot_index = len(file_name_value) if file_name_value.lower().rfind('.') == -1 else file_name_value.lower().rfind('.')
@@ -1231,19 +1283,18 @@ def tab3_create_dq_rules():
                         except Exception as e:
                             st.warning(f"Could not parse output as CSV: {e}")
                             st.text_area(f"{nm} raw", raw, height=200)
-                except httpx.TimeoutException:
-                    st.error("⏱️ Request timed out while calling pipeline. Try again later.")
-                except httpx.RequestError as e:
-                    st.error(f"⚠️ Network error: {e}")
-                except httpx.HTTPStatusError as e:
-                    try:
-                        err = r.json()
-                    except Exception:
-                        err = {"error": str(e)}
-                    st.error("❌ Processing failed.")
-                    st.json(err)
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ **Request Timed Out**: The pipeline took too long to respond. Please check the network or wait a few minutes before retrying.")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"⚠️ **Network Error**: Could not connect to the pipeline service. Details: {e}")
                 except Exception as e:
-                    st.error(f"⚠️ Failed to call DQ pipeline: {e}")
+                    # Provide a clean error message and technical details in an expander
+                    st.error("❌ **DQ Pipeline Execution Failed**")
+                    st.markdown(f"> {str(e)}")
+                    
+                    with st.expander("📋 Technical Error Details"):
+                        st.exception(e)
+
 
 # ------------------------
 # TAB 4: Upload DQ Rules (CSV/TXT) -> create monitors
@@ -1475,19 +1526,17 @@ def tab5_create_link_mapping():
                             st.warning(f"Could not parse output as CSV: {e}")
                             st.text_area(f"{nm} raw", raw, height=200)
 
-                except httpx.TimeoutException:
-                    st.error("⏱️ Request timed out while calling pipeline. Try again later.")
-                except httpx.RequestError as e:
-                    st.error(f"⚠️ Network error: {e}")
-                except httpx.HTTPStatusError as e:
-                    try:
-                        err = r.json()
-                    except Exception:
-                        err = {"error": str(e)}
-                    st.error("❌ Processing failed.")
-                    st.json(err)
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ **Request Timed Out**: The pipeline took too long to respond. Please check the network or wait a few minutes before retrying.")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"⚠️ **Network Error**: Could not connect to the pipeline service. Details: {e}")
                 except Exception as e:
-                    st.error(f"⚠️ Failed to call pipeline: {e}")
+                    st.error("❌ **Link Mapping Failed**")
+                    st.markdown(f"> {str(e)}")
+                    
+                    with st.expander("📋 Technical Error Details"):
+                        st.exception(e)
+
 
     else:
         st.info("Please upload or select both DDL and Glossary files to proceed.")
